@@ -27,7 +27,7 @@
 - Rust `edition = "2024"`, `rust-version = "1.93"` (rustyfit's MSRV). The local toolchain is 1.96.
 - `rustyfit` is pinned `=0.10.3`, Dependabot ignores it, and it only gets bumped after reviewing the diff against its audit doc. Its `serde` feature stays off. Keep `panic = "unwind"` (never `abort`), because the decoder guard relies on `catch_unwind`. The audit and its conditions are in `docs/audits/rustyfit-0.10.3.md`.
 - `Cargo.lock` is committed, and every build uses `--locked`. Run `cargo fmt` before committing; CI runs `fmt --check`, `clippy -D warnings`, `test`, `cargo-deny` and `cargo-audit`.
-- Image: `ghcr.io/noahshoer/{arch}-liftosaur-sync`, `aarch64` only, built in CI on `ubuntu-24.04-arm` (free for public repos).
+- Image: `ghcr.io/noahshoer/{arch}-liftosaur-sync`, `aarch64` only, built in CI on `ubuntu-24.04-arm` (free for public repos). **The GHCR package is private** even though the code repo is public; HA pulls it with a registry credential, as with travelmap. The image ships the third-party licence texts (Task 13).
 - Only Intervals.icu activities with `source == "GARMIN_CONNECT"` and start ≥ `sync_after` are processed.
 - The Strava description is never set. On Intervals.icu, only the description of matched strength activities changes, and only between the `[liftosaur-sync]` and `[/liftosaur-sync]` lines.
 - Option defaults: poll 150 s, notify after 30 min, give up after 180 min, `include_warmups` true, `dry_run` **true**.
@@ -453,6 +453,13 @@ These are the five failure cases most likely to bite. Each has a test listed in 
   - **every API credential is an option, so nothing secret lives in the repo**
 - **Dockerfile:** a `rust:1-alpine` builder, then `FROM ${BUILD_FROM}`; set the `LIFTOSAUR_SYNC_*` env vars. `run.sh` is `#!/usr/bin/with-contenv bashio` + `exec`.
 - **Publish workflow:** like travelmap's (arm64 runner, `GHCR_PAT`, version from `config.yaml`), plus `cargo test --locked` before pushing.
+- **The GHCR package stays private.** After the first push, check under the package's settings that the visibility is *Private*. The `org.opencontainers.image.source` label only links the package to the public repo; it doesn't make it public, but check anyway.
+- **Licence texts in the image.** BSD-3 requires rustyfit's notice to go with binary distributions, so include in the image (e.g. `/usr/share/licenses/liftosaur-sync/`):
+  - rustyfit's `LICENSE-BSD-3-CLAUSE` and `LICENSE-FIT-SDK`
+  - a `THIRD_PARTY_LICENSES` file covering every dependency, generated with `cargo about generate` (add an `about.toml` / template); regenerate it in CI so it never goes stale
+  - this repo's own Apache-2.0 `LICENSE`
+
+  Never commit vendored rustyfit or SDK sources to the public repo, and never relicense under GPL/AGPL (FIT SDK licence §2d). See the audit, §9.
 - **DOCS.md:**
   - prerequisites (Liftosaur key, Intervals.icu ID + key, Strava API app with callback domain `localhost`)
   - install (repository + GHCR registry credential)
@@ -462,7 +469,7 @@ These are the five failure cases most likely to bite. Each has a test listed in 
   - optional Intervals.icu webhook → HA automation → `rest_command` to `/trigger`
   - troubleshooting
 
-**Done when:** a local `docker build` works and the binary starts in the image, the publish workflow pushes the image, and `GHCR_PAT` is set as a repo secret (`gh secret set GHCR_PAT`).
+**Done when:** a local `docker build` works and the binary starts in the image, the licence files are present in the image, the publish workflow pushes the image, the GHCR package is confirmed **private**, and `GHCR_PAT` is set as a repo secret (`gh secret set GHCR_PAT`).
 
 - [ ] Done, reviewed
 
