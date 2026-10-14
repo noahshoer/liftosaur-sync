@@ -25,7 +25,7 @@
   - CI needs no API secrets; only the publish workflow uses `GHCR_PAT`.
 - Turn on GitHub secret scanning and push protection.
 - Rust `edition = "2024"`, `rust-version = "1.93"` (rustyfit's MSRV). The local toolchain is 1.96.
-- `rustyfit` is pinned `=0.10.3`, Dependabot ignores it, and it only gets bumped after reviewing the diff against its audit doc.
+- `rustyfit` is pinned `=0.10.3`, Dependabot ignores it, and it only gets bumped after reviewing the diff against its audit doc. Its `serde` feature stays off. Keep `panic = "unwind"` (never `abort`), because the decoder guard relies on `catch_unwind`. The audit and its conditions are in `docs/audits/rustyfit-0.10.3.md`.
 - `Cargo.lock` is committed, and every build uses `--locked`. Run `cargo fmt` before committing; CI runs `fmt --check`, `clippy -D warnings`, `test`, `cargo-deny` and `cargo-audit`.
 - Image: `ghcr.io/noahshoer/{arch}-liftosaur-sync`, `aarch64` only, built in CI on `ubuntu-24.04-arm` (free for public repos).
 - Only Intervals.icu activities with `source == "GARMIN_CONNECT"` and start ≥ `sync_after` are processed.
@@ -49,7 +49,15 @@ These are the five failure cases most likely to bite. Each has a test listed in 
 - **rustyfit `std` use:** wrap readers and writers in `embedded_io_adapters::std::FromStd`. `Encoder::encode` needs `Write + Seek`, so encode into `FromStd::new(&mut Cursor<Vec<u8>>)`.
 - **Decode with `Decoder::builder().expand_components(false).build()`** when you intend to re-encode.
 - **Comparing messages:** compare them by `(num, fields, developer_fields)`, not as whole `Message`s. The `header` byte holds the local message number, and the encoder reassigns those.
-- **Don't build `set` messages with `Message::from(mesgdef::Set)`.** That conversion goes through an `unsafe` Vec cast (details in the audit). Build the `Field`s yourself; the field-number constants are on `mesgdef::Set` (`TIMESTAMP=254, DURATION=0, REPETITIONS=3, WEIGHT=4, SET_TYPE=5, START_TIME=6, CATEGORY=7, CATEGORY_SUBTYPE=8, MESSAGE_INDEX=10`).
+- **The decoder isn't safe on hostile input** (audit F1–F3):
+  - a 27-byte file panics it (a remainder by zero on invalid base types)
+  - size-0 field definitions use about 10 KB of memory per input byte, an OOM that can't be caught
+  - developer-field lookups take quadratic time
+
+  So every file goes through the guard in Task 3 before `Decoder::decode`.
+- **Building `set` messages:** `Message::from(mesgdef::Set)` is sound per the audit (its `unsafe` cast is a `repr(transparent)` newtype), but building the `Field`s yourself is still the clearer route. The field-number constants are on `mesgdef::Set` (`TIMESTAMP=254, DURATION=0, REPETITIONS=3, WEIGHT=4, SET_TYPE=5, START_TIME=6, CATEGORY=7, CATEGORY_SUBTYPE=8, MESSAGE_INDEX=10`). Use `is_expanded: false`, because `encode` drops expanded fields. Fields 7 and 8 must be `Value::VecUint16`, or `Set::from` ignores them (F11).
+- **Encoder settings:** encode with `HeaderOption::Normal(15)` to keep the output close to the input size (F10). **Never** use `HeaderOption::Compressed`: it corrupts timestamps in 0.10.3 (F6).
+- **Developer fields the encoder refuses:** `Encoder::encode` rejects developer fields that have no `developer_data_id`, even though the decoder accepts them (F4). Treat that as "can't rewrite this activity", not a panic.
 - **Set field units:**
   - `duration` is ms (scale 1000)
   - `weight` is kg × 16
@@ -156,6 +164,22 @@ These are the five failure cases most likely to bite. Each has a test listed in 
 
   It errors if any check fails.
 - **Refusals:** `rewrite` refuses non-strength files and an empty plan.
+- **Decoder guard** (audit conditions C3–C5, C9). `decode` must never be called on a file that hasn't passed it.
+  - **Size cap:** reject input over 4 MiB.
+  - **Pre-scan:** before decoding, walk **every chained sequence** with `Decoder::stream` (`expand_components(false)`), not just the first one (F9). Don't stop at the first `Crc` event. Reject the file on:
+    - any field definition with `size == 0` or `base_type.size() == 0`
+    - any developer field definition with `size == 0`
+    - more than 256 `field_description` messages
+    - a `field_description` whose `fit_base_type_id` (field 2) isn't a `Uint8` with a non-zero `FitBaseType(b).size()`
+    - more than 5,000,000 fields + developer fields in total
+    - any decode error
+
+    The stream decoder reuses one `Message`, so the pre-scan uses constant memory.
+  - **Panics:** wrap decode, the `mesgdef::*::from` conversions, the rewrite and encode in `std::panic::catch_unwind(AssertUnwindSafe(..))`, and turn a caught panic into a `FitError`.
+  - **Checksums:** keep `checksum(true)`, the default, but don't count on it for DoS protection. It's only checked after the whole file is parsed (F8).
+  - **Cost after the pre-scan:** about 80 B of heap per input byte at most, so roughly 320 MiB at the 4 MiB cap.
+  - **No time-box needed:** the pre-scan bounds the decoder's work. A true time-box would need an abandonable worker thread, which isn't worth it.
+  - **Reference:** the auditor wrote a pre-scan in its scratch dir. It's deliberately not copied into the repo.
 
 **Tests to write:**
 - `info` reads the synthetic session
@@ -166,6 +190,8 @@ These are the five failure cases most likely to bite. Each has a test listed in 
 - non-strength and empty plan are rejected
 - garbage, empty and truncated input give `Err` without panicking
 - gzip passthrough and inflate
+- the guard rejects each of the audit's PoC shapes, built in the test with the encoder or as raw bytes: a field with an invalid base type (F1, the 27-byte panic), size-0 fields (F2), more than 256 field descriptions (F3), and a bad file hidden in a second chained sequence (F9). None of them may panic.
+- the guard accepts every real FIT in `tests/data/private/`, so it has no false positives
 - `tests/real_fit.rs` loops over `tests/data/private/*.fit[.gz]` if present
 
 **`fit_tool` dev CLI:** `info <in.fit>` and `rewrite <in.fit> <sets.json> <out.fit>`, where sets.json is `[{category, exercise, reps, weight_kg}]` by FIT name.
@@ -325,7 +351,7 @@ These are the five failure cases most likely to bite. Each has a test listed in 
 **Behaviour:**
 - **Error classes:** 401/403 → `Unauthorized`; 429/5xx/network → `Transient`; anything else → `Permanent`.
 - **Liftosaur:** follow `hasMore`/`nextCursor`.
-- **Intervals.icu:** gunzip downloads; parse `start_date` with or without the `Z`.
+- **Intervals.icu:** gunzip downloads, and cap the body at 4 MiB both compressed and after gunzip (audit C5). A bigger file is `Permanent`. Parse `start_date` with or without the `Z`.
 - **Strava uploads:** poll with a configurable delay (zero in tests) and a max poll count. Parse the duplicate id. A refresh that gets 400 → `Unauthorized`.
 - **Notify:** a missing or blank service means log only.
 
@@ -352,7 +378,8 @@ These are the five failure cases most likely to bite. Each has a test listed in 
 - **Liftosaur/Intervals `Unauthorized`:** a poll-level error. Record it in `last_poll_error` and notify once while it lasts.
 - **`Transient`:** `attempts += 1` and `next_attempt = now + min(retry_base × 2^attempts, 1 h)`.
 - **`Permanent`:** status `Failed` and one notification. If the upload already succeeded, set `description_failed` instead.
-- **Rewrite failure:** upload the original and note why.
+- **Rewrite failure:** upload the original and note why. This includes `encode` refusing developer fields (F4).
+- **Guard failure:** a file the decoder guard rejects, or a caught decoder panic, is uploaded unchanged as a non-FIT would be. It's logged with the reason and never retried every poll.
 - **Dry run:** write `<id>.<type>` and `<id>.description.txt` into `dry_run_dir`, set status `DryRun`, and never call Strava or `set_description`.
 - **Tokens:** refresh when the access token has less than 5 min left, and store the new tokens.
 - **Saving:** call `commit` after each activity.
