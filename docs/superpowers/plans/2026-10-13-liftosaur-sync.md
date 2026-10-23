@@ -14,7 +14,7 @@
   - **Web thread:** serves the ingress status page, the Strava connect form and `/trigger`. It talks to the poll thread only through an `mpsc` channel and a read-only `Arc<Mutex<State>>` snapshot.
 - API clients sit behind traits, so the sync engine is tested with in-memory fakes.
 
-**Tech stack (to be confirmed by the audits in Task 2):** Rust 2024 (MSRV 1.93), `rustyfit =0.10.3`, `embedded-io-adapters` 0.7, `ureq` 3, `tiny_http` 0.12 (see the audit note), `serde`/`serde_json`, `toml` 1, `chrono` 0.4, `flate2` 1, `base64` 0.23, `anyhow`, `log` + `env_logger`.
+**Tech stack (audited in Task 2; versions, feature sets and conditions are in `docs/audits/`):** Rust 2024 (MSRV 1.93), `rustyfit =0.10.3`, `embedded-io-adapters` 0.7, `ureq` 3, `axum` 0.8 + `tokio` 1 (web thread only; replaces the rejected `tiny_http`), `serde`/`serde_json`, `toml` 1, `chrono` 0.4, `flate2` 1, `base64` 0.23, `anyhow`, `log` + `env_logger`.
 
 **Spec:** `docs/superpowers/specs/2026-10-13-liftosaur-sync-design.md`
 
@@ -79,7 +79,7 @@ These are the five failure cases most likely to bite. Each has a test listed in 
   - `localhost` is an allowed redirect domain. A bad code or refresh token gets HTTP 400.
 - **ureq 3:**
   - Build an `Agent` with `http_status_as_error(false)` so 4xx/5xx come back as responses you can classify.
-  - It has no multipart builder, so you'll write a small one.
+  - Its multipart builder (`ureq::unversioned::multipart`, since 3.1.3) is experimental and outside semver, so keep the `multipart` feature off and write a small one yourself.
   - `read_to_vec()` stops at 10 MB by default; use `body_mut().with_config().limit(..)`.
 - **HA:**
   - Ingress requests come from `172.30.32.2`.
@@ -124,7 +124,9 @@ These are the five failure cases most likely to bite. Each has a test listed in 
     - a maintained sync server
     - axum + tokio, which means learning async
 
-**You:** read the audits and decide on the tiny_http question. Nothing in Task 3+ adds a crate that hasn't been audited.
+**Decided (2026-10-22):** `tiny_http` is rejected (an oversized `Content-Length` aborts the process; see its audit). The web server is `axum` 0.8 + `tokio` 1, chosen as the industry-standard stack; its audit is `docs/audits/axum-*-tokio-*.md`.
+
+**You:** read the audits. Nothing in Task 3+ adds a crate that hasn't been audited.
 
 - [ ] rustyfit audit + fuzz run reviewed
 - [ ] Other crates audited, HTTP server choice made
@@ -355,9 +357,9 @@ These are the five failure cases most likely to bite. Each has a test listed in 
 - **Strava uploads:** poll with a configurable delay (zero in tests) and a max poll count. Parse the duplicate id. A refresh that gets 400 → `Unauthorized`.
 - **Notify:** a missing or blank service means log only.
 
-**Tests:** run each client against a `tiny_http` fake that replays canned responses and records requests. Check auth headers, query strings, pagination, the multipart layout, duplicate parsing and status classification.
+**Tests:** run each client against a local fake server (the axum/tokio audit recommends how to build it) that replays canned responses and records requests. Check auth headers, query strings, pagination, the multipart layout, duplicate parsing and status classification.
 
-**APIs:** `ureq` 3 (`Agent::config_builder`, `.query`, `.header`, `send_form`, `send_json`, `body_mut().read_json()`, at docs.rs/ureq/3) and the `http` types it re-exports. `base64` 0.23 needs the `Engine` trait in scope. There's no multipart support, so follow RFC 7578.
+**APIs:** `ureq` 3 (`Agent::config_builder`, `.query`, `.header`, `send_form`, `send_json`, `body_mut().read_json()`, at docs.rs/ureq/3) and the `http` types it re-exports. `base64` 0.23 needs the `Engine` trait in scope. Don't enable ureq's experimental `multipart` feature; build the body yourself following RFC 7578.
 
 - [ ] Clients + fakes + tests, reviewed
 
@@ -434,7 +436,7 @@ These are the five failure cases most likely to bite. Each has a test listed in 
 
 **Local dry run:** with your own `options.local.json`, run it against the real services with `dry_run: true`, then fill `data/exercises.toml` using `unmapped`.
 
-**APIs:** `tiny_http` 0.12, or whatever Task 2 chose. `Request::remote_addr` gives you the ingress-IP check.
+**APIs:** `axum` 0.8 on a `tokio` `current_thread` runtime owned by the web thread; the poll loop stays a plain `std::thread`, and `handle` stays pure and synchronous so the tests don't need a runtime. Get the peer IP for the ingress check from `ConnectInfo<SocketAddr>` (serve with `into_make_service_with_connect_info`). Feature sets, the header-read timeout and body-limit settings are in the axum/tokio audit's conditions. Don't hold a `std::sync::Mutex` guard across an `.await`.
 
 - [ ] Done, local dry run OK, mapping filled from history, reviewed
 
