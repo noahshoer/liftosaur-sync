@@ -9,7 +9,7 @@ on:
 jobs:
   build-and-test:
     name: Build and Test
-    runs-on: debian-latest
+    runs-on: ubuntu-latest
 
     steps:
       - name: Checkout the code
@@ -33,7 +33,7 @@ jobs:
         run: cargo fmt --check
 
       - name: Lint with Clippy
-        run: cargo clippy --no-dep --all-targets -- -D warnings
+        run: cargo clippy --no-deps --all-targets -- -D warnings
 
       - name: Run Tests
         run: cargo test --all-targets --all-features
